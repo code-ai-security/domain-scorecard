@@ -1,0 +1,6 @@
+# Scan results and logs stay on this laptop
+scorecard.db
+scorecard.db-*
+server.log
+__pycache__/
+*.pyc

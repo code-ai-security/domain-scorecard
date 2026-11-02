@@ -1,0 +1,4 @@
+# One domain per line. For CSV files, the first column is used.
+# Lines starting with # are ignored. URLs are fine; they get reduced to the domain.
+example.com
+https://www.example.org/
