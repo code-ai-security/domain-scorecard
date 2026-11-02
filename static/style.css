@@ -139,3 +139,6 @@ tr:hover td { background: var(--wash); }
 .finding summary { flex-wrap: wrap; }
 .finding summary .title { flex: 1 1 240px; }
 .toolbar h2 { margin: 0; }
+
+#changes .tiles { margin-bottom: 10px; }
+#changes .toolbar h2 { overflow-wrap: anywhere; }

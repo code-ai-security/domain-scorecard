@@ -204,7 +204,7 @@ function table(data) {
     h("thead", {}, h("tr", {},
       header("Domain", "domain"), header("Score", "score", true), h("th", {}, "Change"),
       factorKeys.map((k) => header(short[k] || k, k, true)),
-      header("Critical", "critical", true), header("High", "high", true),
+      header("Critical", "critical", true), header("High", "high", true), h("th", {}, "Since last scan"),
       header("Last scan", "scanned"), h("th", {}, h("span", { hidden: true }, "Actions")))),
     h("tbody", {}, rows.map((row) => {
       const change = row.score !== null && row.previous_score !== null ? row.score - row.previous_score : null;
@@ -216,6 +216,7 @@ function table(data) {
         factorKeys.map((k) => h("td", { class: "num" }, row.factors[k] === undefined || row.factors[k] === null ? "–" : String(row.factors[k]))),
         h("td", { class: "num" }, String(row.counts.critical ?? "–")),
         h("td", { class: "num" }, String(row.counts.high ?? "–")),
+        h("td", { class: "muted" }, row.changes ? `${row.changes.fixed} fixed, ${row.changes.new} new` : "–"),
         h("td", {}, statusCell(row)),
         h("td", {}, h("button", {
           class: "small", disabled: row.status === "running" || row.status === "queued",
@@ -379,6 +380,45 @@ function renderIssues(issues) {
   ];
 }
 
+function changeItem(item, state, label) {
+  return h("details", { class: "finding change" },
+    h("summary", {},
+      h("span", { class: `pill ${state}` }, label),
+      h("span", { class: "title" }, item.title),
+      item.remaining ? h("span", { class: "muted small" }, `${item.remaining} remaining`) : null,
+      item.assets.length ? h("span", { class: "muted small" }, `${item.assets.length} item${item.assets.length === 1 ? "" : "s"}`) : null,
+      h("span", { class: "muted small factor-name" }, item.factor_name)),
+    h("div", { class: "body" },
+      item.note ? h("p", {}, item.note) : null,
+      item.assets.length ? h("ul", { class: "affected" }, item.assets.map((target) =>
+        h("li", {}, target.url ? externalLink(target.url, target.label) : target.label))) : null));
+}
+
+function changesCard(domain, change) {
+  const tile = (value, label) => h("div", { class: "tile" }, h("div", { class: "value" }, String(value)), h("div", { class: "muted small" }, label));
+  const scoreDiff = change.previous_score !== null && change.current_score !== null ? change.current_score - change.previous_score : null;
+  const group = (title, items, state, label, open) => items.length ? [
+    h("h3", { class: "section-title" }, `${title} (${items.length})`),
+    items.map((item) => { const row = changeItem(item, state, label); row.open = !!open; return row; })] : [];
+  const nothing = !change.fixed.length && !change.partly_fixed.length && !change.unconfirmed.length && !change.new.length;
+  return h("section", { class: "card", id: "changes" },
+    h("div", { class: "toolbar" },
+      h("h2", {}, `Changes since the scan on ${when(change.previous_scanned)}`),
+      h("a", { class: "button small", href: `/api/domains/${encodeURIComponent(domain)}/changes.csv` }, "Export changes CSV")),
+    h("div", { class: "tiles" },
+      tile(change.fixed.length, "Issues fixed"),
+      tile(change.partly_fixed.length, "Partly fixed"),
+      tile(change.new.length, "New issues"),
+      tile(change.unconfirmed.length, "Could not confirm"),
+      tile(scoreDiff === null ? "–" : `${scoreDiff > 0 ? "+" : ""}${scoreDiff}`, "Score change")),
+    change.wider_coverage ? h("p", { class: "note small" }, "The earlier scan tested fewer hosts, so some new issues may have existed before.") : null,
+    nothing ? h("p", { class: "muted" }, "No issues were fixed or added between these two scans.") : null,
+    group("Fixed", change.fixed, "pass", "Fixed", true),
+    group("Partly fixed", change.partly_fixed, "pass", "Partly", true),
+    group("New issues", change.new, "critical", "New", true),
+    group("Could not confirm", change.unconfirmed, "unknown", "Unsure", false));
+}
+
 function renderDomain(detail) {
   const latest = detail.latest;
   const current = detail.history[detail.history.length - 1];
@@ -412,6 +452,8 @@ function renderDomain(detail) {
       remove),
   ));
   if (!latest) return blocks;
+
+  if (detail.changes) blocks.push(changesCard(detail.domain, detail.changes));
 
   blocks.push(h("div", { class: "two" },
     h("section", { class: "card" }, h("h2", {}, "Factor scores"),
@@ -453,12 +495,13 @@ function renderDomain(detail) {
 
   blocks.push(h("section", { class: "card" }, h("h2", {}, "Scan history"),
     h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, h("th", {}, "Date"), h("th", { class: "num" }, "Score"), h("th", {}, "Grade"), h("th", { class: "num" }, "Coverage"), h("th", {}, "Result"))),
+      h("thead", {}, h("tr", {}, h("th", {}, "Date"), h("th", { class: "num" }, "Score"), h("th", {}, "Grade"), h("th", { class: "num" }, "Coverage"), h("th", {}, "Changes"), h("th", {}, "Result"))),
       h("tbody", {}, detail.history.slice().reverse().map((s) => h("tr", {},
         h("td", {}, when(s.finished_at || s.requested_at)),
         h("td", { class: "num" }, s.score === null ? "–" : String(s.score)),
         h("td", {}, s.grade || "–"),
         h("td", { class: "num" }, s.coverage === null ? "–" : `${s.coverage}%`),
+        h("td", {}, s.changes ? `${s.changes.fixed} fixed, ${s.changes.partly_fixed} partly, ${s.changes.new} new` : "–"),
         h("td", {}, s.status === "error" ? s.error : s.status === "done" ? (s.deep ? "Done, deep" : "Done") : s.status))))))));
   return blocks;
 }

@@ -15,6 +15,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import compare
 import remediation
 import scanner
 
@@ -60,6 +61,21 @@ def init_db():
         connection.execute(
             "UPDATE scans SET status='error', error='Interrupted when the app stopped.', finished_at=? "
             "WHERE status IN ('queued','running')", (time.time(),))
+    backfill_changes()
+
+
+def backfill_changes():
+    """Record fixed and new counts for scans made before this feature existed."""
+    with db() as connection:
+        rows = connection.execute("SELECT id,domain,summary,result FROM scans WHERE status='done' ORDER BY id").fetchall()
+        previous = {}
+        for row in rows:
+            summary = json.loads(row["summary"] or "{}")
+            result = json.loads(row["result"])
+            if row["domain"] in previous and "changes" not in summary:
+                summary["changes"] = compare.counts(compare.compare(previous[row["domain"]], result))
+                connection.execute("UPDATE scans SET summary=? WHERE id=?", (json.dumps(summary), row["id"]))
+            previous[row["domain"]] = result
 
 
 def enqueue(domains, deep):
@@ -113,6 +129,10 @@ def run_scan(scan_id, domain, deep):
             counts[finding["severity"]] += 1
     summary = {"factors": {k: v["score"] for k, v in result["factors"].items()}, "counts": counts}
     with db() as connection:
+        previous = connection.execute("SELECT result FROM scans WHERE domain=? AND status='done' ORDER BY id DESC LIMIT 1",
+                                      (domain,)).fetchone()
+        if previous:
+            summary["changes"] = compare.counts(compare.compare(json.loads(previous["result"]), result))
         connection.execute(
             "UPDATE scans SET status='done', stage=NULL, finished_at=?, score=?, grade=?, coverage=?, summary=?, "
             "result=? WHERE id=?",
@@ -136,13 +156,14 @@ def portfolio():
         for scan in cursor:
             row = rows.setdefault(scan["domain"], {
                 "domain": scan["domain"], "score": None, "previous_score": None, "grade": None,
-                "coverage": None, "factors": {}, "counts": {}, "last_scanned": None, "scan_id": None})
+                "coverage": None, "factors": {}, "counts": {}, "last_scanned": None, "scan_id": None, "changes": None})
             row["status"], row["stage"], row["error"] = scan["status"], scan["stage"], scan["error"]
             if scan["status"] == "done":
                 row["previous_score"] = row["score"]
                 summary = json.loads(scan["summary"] or "{}")
                 row.update(score=scan["score"], grade=scan["grade"], coverage=scan["coverage"],
                            factors=summary.get("factors", {}), counts=summary.get("counts", {}),
+                           changes=summary.get("changes"),
                            last_scanned=scan["finished_at"], scan_id=scan["id"])
     pending = jobs.qsize()
     return {"domains": sorted(rows.values(), key=lambda r: r["domain"]), "queue": pending,
@@ -152,14 +173,39 @@ def portfolio():
 def domain_detail(domain):
     with db() as connection:
         history = connection.execute(
-            "SELECT id,status,stage,deep,requested_at,finished_at,score,grade,coverage,error FROM scans "
+            "SELECT id,status,stage,deep,requested_at,finished_at,score,grade,coverage,error,summary FROM scans "
             "WHERE domain=? ORDER BY id", (domain,)).fetchall()
-        latest = connection.execute(
-            "SELECT result FROM scans WHERE domain=? AND status='done' ORDER BY id DESC LIMIT 1", (domain,)).fetchone()
+        recent = connection.execute(
+            "SELECT result FROM scans WHERE domain=? AND status='done' ORDER BY id DESC LIMIT 2", (domain,)).fetchall()
     if not history:
         return None
-    return {"domain": domain, "history": [dict(h) for h in history],
-            "latest": remediation.enrich(json.loads(latest["result"])) if latest else None}
+    rows = []
+    for scan in history:
+        row = dict(scan)
+        row["changes"] = json.loads(row.pop("summary") or "{}").get("changes")
+        rows.append(row)
+    latest = json.loads(recent[0]["result"]) if recent else None
+    changes = compare.compare(json.loads(recent[1]["result"]), latest) if len(recent) == 2 else None
+    return {"domain": domain, "history": rows, "changes": changes,
+            "latest": remediation.enrich(latest) if latest else None}
+
+
+def changes_csv(domain):
+    """One row per item, for tracking fixes outside the app."""
+    detail = domain_detail(domain)
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["domain", "change", "severity", "factor", "issue", "item", "url", "note", "compared_to_utc"])
+    change = (detail or {}).get("changes")
+    if change:
+        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(change["previous_scanned"]))
+        names = (("fixed", "Fixed"), ("partly_fixed", "Partly fixed"), ("unconfirmed", "Could not confirm"), ("new", "New"))
+        for bucket, name in names:
+            for item in change[bucket]:
+                for target in item["assets"] or [{"label": domain, "url": None}]:
+                    writer.writerow([csv_safe(v) for v in (domain, name, item["severity"], item["factor_name"], item["title"],
+                                                           target["label"], target.get("url"), item.get("note"), when)])
+    return out.getvalue().encode()
 
 
 def all_issues(domain=None):
@@ -274,6 +320,13 @@ class Handler(BaseHTTPRequestHandler):
             name = f"{domain}-issues.csv" if domain else "all-issues.csv"
             return self.send_body(200, issues_csv(domain), "text/csv; charset=utf-8",
                                   {"Content-Disposition": f'attachment; filename="{name}"'})
+        match = re.fullmatch(r"/api/domains/([^/]+)/changes\.csv", path)
+        if match:
+            domain = scanner.normalize_domain(urllib.parse.unquote(match.group(1)))
+            if not domain:
+                return self.send_json({"error": "Domain not found."}, 404)
+            return self.send_body(200, changes_csv(domain), "text/csv; charset=utf-8",
+                                  {"Content-Disposition": f'attachment; filename="{domain}-changes.csv"'})
         match = re.fullmatch(r"/api/domains/([^/]+)(/report\.json)?", path)
         if match:
             detail = domain_detail(urllib.parse.unquote(match.group(1)))
@@ -364,7 +417,12 @@ def main():
     parser = argparse.ArgumentParser(description="Domain Scorecard local dashboard")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--domains", help="Text or CSV file of domains to queue at startup")
+    parser.add_argument("--db", help="Database file to use instead of scorecard.db")
     args = parser.parse_args()
+
+    if args.db:
+        global DB_PATH
+        DB_PATH = Path(args.db)
 
     init_db()
     for _ in range(WORKERS):

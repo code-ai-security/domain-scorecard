@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import app
+import compare
 import remediation
 import scanner
 from scanner import Page, Report
@@ -314,6 +315,82 @@ class Issues(unittest.TestCase):
     def test_csv_blocks_formulas(self):
         self.assertEqual(app.csv_safe("=cmd()"), "'=cmd()")
         self.assertEqual(app.csv_safe("https://x.test/"), "https://x.test/")
+
+
+class ChangesAfterRescan(unittest.TestCase):
+    URL = "https://x.test/"
+
+    def scan(self, *findings, deep=False, ips=()):
+        return {"domain": "x.test", "deep": deep, "score": 50, "finished": 1, "assets": {"ips": list(ips), "hosts_tested": ["x.test"]},
+                "findings": [{"factor": "web", "factor_name": "App", "check": c, "title": t, "status": st,
+                              "severity": "medium" if st == "fail" else "info", "affected": a} for c, t, st, a in findings]}
+
+    def link(self, url=None):
+        return [{"label": url or self.URL, "url": url or self.URL}]
+
+    def test_retested_and_passing_is_fixed(self):
+        change = compare.compare(self.scan(("hsts", "No HSTS", "fail", self.link())), self.scan(("hsts", "HSTS on", "pass", self.link())))
+        self.assertEqual([i["title"] for i in change["fixed"]], ["No HSTS"])
+        self.assertEqual(change["unconfirmed"], [])
+
+    def test_bot_wall_is_not_called_fixed(self):
+        before = self.scan(("hsts", "No HSTS", "fail", self.link()))
+        after = self.scan(("https", "HTTPS works", "pass", self.link()))  # headers were never read
+        change = compare.compare(before, after)
+        self.assertEqual(change["fixed"], [])
+        self.assertEqual(len(change["unconfirmed"]), 1)
+
+    def test_site_down_is_not_called_fixed(self):
+        change = compare.compare(self.scan(("cert", "Expired", "fail", self.link())), self.scan())
+        self.assertEqual(change["fixed"], [])
+        self.assertEqual(len(change["unconfirmed"]), 1)
+
+    def test_changing_title_is_still_the_same_issue(self):
+        change = compare.compare(self.scan(("cert", "Expires in 6 days", "fail", self.link())),
+                                 self.scan(("cert", "Expires in 5 days", "fail", self.link())))
+        self.assertEqual((change["fixed"], change["new"], change["still_open"]), ([], [], 1))
+
+    def test_partial_fix_lists_only_what_was_fixed(self):
+        a, b = "https://a.x.test/", "https://b.x.test/"
+        change = compare.compare(self.scan(("csp", "No CSP", "fail", self.link(a) + self.link(b))),
+                                 self.scan(("csp", "No CSP", "fail", self.link(b)), ("csp", "CSP set", "pass", self.link(a))))
+        self.assertEqual([x["url"] for x in change["partly_fixed"][0]["assets"]], [a])
+        self.assertEqual(change["partly_fixed"][0]["remaining"], 1)
+
+    def test_new_issue_and_new_url_are_reported(self):
+        a, b = "https://a.x.test/", "https://b.x.test/"
+        change = compare.compare(self.scan(("csp", "No CSP", "fail", self.link(a))),
+                                 self.scan(("csp", "No CSP", "fail", self.link(a) + self.link(b)), ("hsts", "No HSTS", "fail", self.link(a))))
+        self.assertEqual(sorted(i["title"] for i in change["new"]), ["No CSP", "No HSTS"])
+        self.assertEqual([x["url"] for x in change["new"][0]["assets"]], [b])
+
+    def test_cve_moving_between_severity_tiers_is_not_fixed_or_new(self):
+        row = [{"label": "CVE-2021-1 (CVSS 9.0) on 203.0.113.5 (x.test)", "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-1"}]
+        change = compare.compare(self.scan(("cve-unrated", "1 unrated", "fail", row)), self.scan(("cve-kev", "1 exploited", "fail", row)), )
+        self.assertEqual((change["fixed"], change["new"], change["still_open"]), ([], [], 1))
+
+    def test_cve_gone_while_ip_remains_is_fixed_with_a_caveat(self):
+        row = [{"label": "CVE-2021-1 on 203.0.113.5 (x.test)", "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-1"}]
+        change = compare.compare(self.scan(("cve-high", "1 CVE", "fail", row)),
+                                 self.scan(("cves", "No CVEs", "pass", []), ips=["203.0.113.5"]))
+        self.assertEqual(len(change["fixed"]), 1)
+        self.assertIn("Shodan", change["fixed"][0]["note"])
+
+    def test_cve_on_an_ip_that_left_the_scan_is_unconfirmed(self):
+        row = [{"label": "CVE-2021-1 on 203.0.113.5 (x.test)", "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-1"}]
+        change = compare.compare(self.scan(("cve-high", "1 CVE", "fail", row)), self.scan(("cves", "No CVEs", "pass", [])))
+        self.assertEqual(change["fixed"], [])
+        self.assertEqual(len(change["unconfirmed"]), 1)
+
+    def test_deep_issue_is_unconfirmed_after_a_normal_rescan(self):
+        row = self.link("https://x.test/.env")
+        change = compare.compare(self.scan(("exposed/.env", "Exposed .env", "fail", row), deep=True), self.scan())
+        self.assertEqual(change["fixed"], [])
+        self.assertEqual(len(change["unconfirmed"]), 1)
+
+    def test_old_scan_without_affected_items_still_compares(self):
+        change = compare.compare(self.scan(("dnssec", "No DNSSEC", "fail", [])), self.scan(("dnssec", "DNSSEC on", "pass", [])))
+        self.assertEqual(len(change["fixed"]), 1)
 
 
 class Portfolio(unittest.TestCase):

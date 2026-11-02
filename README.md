@@ -29,6 +29,12 @@ Enter one domain, paste a list, or upload a `.txt` or `.csv` file (first column)
 
 Each issue lists every affected URL or asset, why it matters, fix steps, example config where useful, a command to check the fix, and references. Issues open expanded on the domain page. **All issues** shows them across every domain. **Export issues CSV** gives one row per affected URL.
 
+## After a rescan
+
+Each domain page has a **Changes since the scan** section: issues fixed, partly fixed and new, plus the score change. **Export changes CSV** gives one row per item.
+
+An issue only counts as fixed when the rescan re-tested that item and it passed. If the site was down, returned a bot wall, or the check didn't run, the item appears under **Could not confirm**. CVE and port results come from Shodan, whose data can lag, so confirm those on the server. Deep-check findings need a deep rescan, and the Rescan button runs a normal scan, so run a deep scan from the scan form to confirm them.
+
 ## How scoring works
 
 - Each factor starts at 100 and loses points per failed check: critical 40, high 20, medium 10, low 3.
